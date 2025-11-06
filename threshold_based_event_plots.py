@@ -41,6 +41,23 @@ import matplotlib.pyplot as plt
 import matplotlib as mpl
 from matplotlib.patches import Rectangle
 import matplotlib.cm as cm
+import time
+import pandas as pd
+import seaborn as sns
+
+def getRMSDataPath(binFullPath):
+    parent_path = binFullPath.parent
+    bin_name = binFullPath.stem
+    rms_name = f'{bin_name}_est_rms.npy'
+    rms_path = parent_path.joinpath(rms_name)
+    return rms_path
+
+def getFrRMSdfPath(binFullPath):
+    parent_path = binFullPath.parent
+    bin_name = binFullPath.stem
+    rms_name = f'{bin_name}_fr_rms.csv'
+    rms_path = parent_path.joinpath(rms_name)
+    return rms_path
 
 def getDriftDataPath(binFullPath, sh_index):
     parent_path = binFullPath.parent
@@ -269,12 +286,14 @@ def readData(binFullPath, selected_sh, time_sec = 300, excl_chan = [127], thresh
     # Read in metadata; returns a dictionary with string for values
     meta = readMeta(binFullPath)
     parent_path = binFullPath.parent
+    quirogaDenom = 0.6745
 
     # plan to detect peaks in the last 5 minutes of recording
     sRate = SampRate(meta)
     n_ap, n_lf, n_sync = ChannelCountsIM(meta)
     APChan0_to_uV = ChanGainsIM(meta)[2]
     thresh_bits = thresh/APChan0_to_uV
+    maxInt = int(meta['imMaxInt'])
     x_coord, z_coord, sh_ind, connected, n_chan_tot = \
         MetaToCoords(binFullPath.with_suffix('.meta') , -1)
     rawData = makeMemMapRaw(binFullPath, meta)
@@ -284,6 +303,18 @@ def readData(binFullPath, selected_sh, time_sec = 300, excl_chan = [127], thresh
     start_samp = np.floor(nFileSamp - time_sec*sRate).astype(int)
     if start_samp < 0:
         start_samp = 0
+        
+    # check for file of rms estimates. If absent, calc for whole probe
+    # (just saves reassembling from a file per shank)
+    rmsFullPath = getRMSDataPath(binFullPath)
+    if not(rmsFullPath.is_file()):
+        rms_est = np.zeros((nChan,))
+        for i in range(nChan):
+            curr_samp = rawData[i,start_samp:]        
+            rms_est[i] = estMedian(curr_samp, maxInt)
+        rms_est = rms_est*APChan0_to_uV/quirogaDenom
+        np.save(rmsFullPath,rms_est)
+    
     batch_samp = np.floor(2*sRate).astype(int)
     n_batch = np.floor((nFileSamp - start_samp)/batch_samp).astype(int)
     sel_sh_ind = np.where(sh_ind == selected_sh)[0]   
@@ -308,8 +339,7 @@ def readData(binFullPath, selected_sh, time_sec = 300, excl_chan = [127], thresh
             all_spikes = np.vstack((peak_ind, xz[:,1].T, peak_sig, xz[:,0].T,peak_chan)).T
         else:
             curr_spikes = np.vstack((peak_ind, xz[:,1].T, peak_sig, xz[:,0].T,peak_chan)).T
-            all_spikes = np.concatenate((all_spikes,curr_spikes))
-            
+            all_spikes = np.concatenate((all_spikes,curr_spikes))    
         
         
     dd_path = getDriftDataPath(binFullPath, selected_sh)
@@ -471,6 +501,77 @@ def plotRateVsZ(bin_list, day_list, selected_sh):
     
     plt.show()  
     
+def estMedian(curr_samp, maxInt):
+    nSamp = curr_samp.shape
+    hist_edges = np.arange(maxInt)
+    curr_dev = np.abs(curr_samp)
+    counts = np.histogram(curr_dev, hist_edges)[0]
+    dev_median = np.median(curr_dev)
+    # interpolate the median bin in the cumulative dist to estimate the true median
+    # This is 'estimating the mean for grouped data', wehre the groups are the bins
+    lower_bound = int(dev_median)
+    if lower_bound > 0:
+        yDist = nSamp/2 - sum(counts[0:lower_bound])
+    med_est = lower_bound + yDist/counts[lower_bound]
+    return med_est
+    
+    
+def estAllRMS(binFullPath, time_sec = 300, thresh = -80):
+    # for each channel, get the mean absolute deviation 
+    quirogaDenom = 0.6745
+    # Read in metadata; returns a dictionary with string for values
+    meta = readMeta(binFullPath)    
+    # plan to detect peaks in the last 5 minutes of recording
+    sRate = SampRate(meta)
+    n_ap, n_lf, n_sync = ChannelCountsIM(meta)
+    maxInt = int(meta['imMaxInt'])
+    APChan0_to_uV = ChanGainsIM(meta)[2]
+    rawData = makeMemMapRaw(binFullPath, meta)
+    nChan, nFileSamp = rawData.shape
+    sampRange = np.floor(time_sec*sRate).astype(int)
+    rms_est = np.zeros((nChan,))
+    for i in range(nChan):
+        curr_samp = rawData[i,0:sampRange]        
+        rms_est[i] = estMedian(curr_samp, maxInt)
+        
+    rms_est = rms_est*(APChan0_to_uV/quirogaDenom)      
+    np.save(getRMSDataPath(binFullPath), rms_est)
+    return rms_est
+        
+        
+def build_rms_table(binFullPath):
+    # read in meta, rms est, and dd files, create csv of channel, position, firing rate, rms
+    x_coord, z_coord, sh_ind, connected, n_chan_tot = \
+        MetaToCoords(binFullPath.with_suffix('.meta') , -1)
+    rms = np.load(getRMSDataPath(binFullPath))
+    n_chan = x_coord.shape[0]
+    sh_present = np.unique(sh_ind)
+    FR_rms_data = np.zeros((n_chan,6))
+    FR_rms_data[:,0] = np.arange(n_chan)
+    FR_rms_data[:,1] = sh_ind
+    FR_rms_data[:,2] = x_coord
+    FR_rms_data[:,3] = z_coord
+    FR_rms_data[:,5] = rms[0:n_chan]
+    
+    for sh in sh_present.astype(int):
+        orig_ch_ind = np.where(sh_ind == sh)[0]
+        dd_curr = np.load(getDriftDataPath(binFullPath, sh))
+        pk_chan, counts = np.unique(dd_curr[:,4], return_counts=True)
+        span = np.max(dd_curr[:,0]) - np.min(dd_curr[:,0])
+        curr_FR = counts.astype(float)/span
+        orig_pk_chan = orig_ch_ind[pk_chan.astype(int)]
+        FR_rms_data[orig_pk_chan,4] = curr_FR
+    # load data into a dataframe for plotting and csv
+    column_names = ['chan','sh','x','z','firing_rate','est_rms']
+    FR_rms_df = pd.DataFrame(data=FR_rms_data, columns=column_names)
+    FR_rms_df.to_csv(getFrRMSdfPath(binFullPath))
+        
+def plotRMS(binFullPath, FR_th=0.1):
+    # read dataframe of firing rate and rms data, swarm plot of noise vs. shank
+    # for sites with firing rate < threshold
+    rms_df = pd.read_csv(getFrRMSdfPath(binFullPath), index_col=0)
+    rms_pass_th = rms_df[ rms_df["firing_rate"]<FR_th ]
+    sns.swarmplot(rms_pass_th,x='sh',y='est_rms')
     
 def main():
     # samples for calling the above functions
@@ -494,7 +595,7 @@ def main():
     
     prb_ind = 0
     sh_list = [0,1,2,3]
-    b_recalc = True
+    b_recalc = False
     
     analysis_time_sec = 300  # readData extracts spikes in the last analysis_time_sec of the recording
     excl_chan = [96] # 127 is ref; add known noisy channels    
@@ -511,12 +612,12 @@ def main():
             bin_name = f'{rec_list[ind1]}_tcat.imec{prb_ind}.ap.bin'
             bin_list.append(bin_parent.joinpath(bin_dir,bin_name))
             
-        
         print(bin_list)
         
         if b_recalc:
             for binFullPath in bin_list:               
                 readData(binFullPath, sh_ind, analysis_time_sec, excl_chan, threshold)
+                
                 
         # # for testing plotting, read bin_list[0]
         #out_name = f'drift_data_sh{sh_ind}.npy'
@@ -526,8 +627,18 @@ def main():
         # load saved drift data and plot        
         plotMult(bin_list,drift_list,sh_ind)
         plotRateVsZ(bin_list, day_list, sh_ind)
+       
+        if sh_ind == sh_list[0]:
+            for binFullPath in bin_list:
+                # make df of FR and rms for noise est
+                build_rms_table(binFullPath)
+                plotRMS(binFullPath)
         
-    plotMultPDF(bin_list, sh_list)
-    plotSpikeRate(bin_list, day_list, sh_list)        
+    #plotMultPDF(bin_list, sh_list)
+    plotSpikeRate(bin_list, day_list, sh_list)    
+    
+    
+    
+    
 if __name__ == "__main__":
         main()  
